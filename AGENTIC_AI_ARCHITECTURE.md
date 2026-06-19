@@ -130,31 +130,68 @@ This layer defines the type system that every other layer implements against. No
 
 ### 3.1 Universal Plugin Interface
 
-```
-interface Plugin {
-  id:       string          // globally unique, semver-tagged
-  version:  semver
-  hooks:    PluginHook[]    // lifecycle points this plugin binds to
-  init(config: Config): Promise<void>
-  teardown(): Promise<void>
-  healthCheck(): HealthStatus
-}
+Defined as Python Abstract Base Classes (the platform core is Python). TypeScript SDK plugins mirror this contract via interface files generated from the Python ABCs.
 
-enum PluginHook {
-  PRE_REQUEST, POST_REQUEST,
-  PRE_LLM_CALL, POST_LLM_CALL,
-  PRE_TOOL_EXEC, POST_TOOL_EXEC,
-  PRE_RESPONSE, POST_RESPONSE,
-  ON_ERROR, ON_COST_THRESHOLD,
-  ON_PII_DETECTED, ON_HALLUCINATION_DETECTED
-}
+```python
+# core/interfaces/plugin.py
+from abc import ABC, abstractmethod
+from enum import Enum
+from dataclasses import dataclass
+from typing import Any
+
+class PluginHook(str, Enum):
+    PRE_REQUEST           = "PRE_REQUEST"
+    POST_REQUEST          = "POST_REQUEST"
+    PRE_LLM_CALL          = "PRE_LLM_CALL"
+    POST_LLM_CALL         = "POST_LLM_CALL"
+    PRE_TOOL_EXEC         = "PRE_TOOL_EXEC"
+    POST_TOOL_EXEC        = "POST_TOOL_EXEC"
+    PRE_RESPONSE          = "PRE_RESPONSE"
+    POST_RESPONSE         = "POST_RESPONSE"
+    ON_ERROR              = "ON_ERROR"
+    ON_COST_THRESHOLD     = "ON_COST_THRESHOLD"
+    ON_PII_DETECTED       = "ON_PII_DETECTED"
+    ON_HALLUCINATION      = "ON_HALLUCINATION"
+
+@dataclass
+class HealthStatus:
+    healthy: bool
+    message: str
+    details: dict[str, Any] | None = None
+
+class Plugin(ABC):
+    """Base class for all platform plugins. Every plugin must implement this."""
+
+    @property
+    @abstractmethod
+    def id(self) -> str: ...          # globally unique, e.g. "my-org.cost-reporter"
+
+    @property
+    @abstractmethod
+    def version(self) -> str: ...     # semver string, e.g. "1.2.0"
+
+    @property
+    @abstractmethod
+    def hooks(self) -> list[PluginHook]: ...   # which lifecycle points this binds to
+
+    @abstractmethod
+    async def init(self, config: dict[str, Any]) -> None: ...
+
+    @abstractmethod
+    async def teardown(self) -> None: ...
+
+    @abstractmethod
+    def health_check(self) -> HealthStatus: ...
 ```
 
 ### 3.2 Core Domain Types
 
+All types carry a `schema_version` field from day 1. When a type evolves, consumers check the version and apply a migration shim. This prevents silent incompatibilities between old queue messages and new consumers.
+
 ```
 // Every execution unit
 type AgentRun = {
+  schema_version: int       // increment on any breaking field change
   runId:       UUID
   tenantId:    UUID
   agentId:     UUID
@@ -312,8 +349,8 @@ Key structure: {prefix}_{tenant_short}_{random_32bytes_base58}
 Example:       aai_acme_3xR7mKp2...
 
 Key record:
-  keyId:          UUID (public, non-secret)
-  keyHash:        bcrypt(key, cost=12)  -- stored, never the key itself
+  keyId:          UUID (public, non-secret — returned to user at creation)
+  keyHash:        HMAC-SHA256(key, server_secret)  -- stored, never the key itself
   tenantId:       UUID
   createdBy:      UUID
   scopes:         string[]
@@ -324,8 +361,15 @@ Key record:
   rotationPolicy: RotationPolicy
 ```
 
-Key verification is constant-time comparison to prevent timing attacks.
-Keys are hashed with bcrypt (not SHA) because bcrypt is slow by design.
+**Why HMAC-SHA256, not bcrypt:**
+API keys are 32 random bytes (256 bits of entropy). Brute force is computationally infeasible regardless of hash speed. bcrypt is designed for *low-entropy* passwords (short, human-memorable). Using bcrypt at cost=12 adds 200-400ms per verification — catastrophic at API gateway throughput. HMAC-SHA256 is the correct choice for high-entropy tokens (used by GitHub, Stripe, and all major API platforms).
+
+Key verification process:
+1. Compute `HMAC-SHA256(presented_key, server_secret)` — constant-time
+2. Compare to stored `keyHash` — constant-time comparison (no timing leak)
+3. Cache result in Redis: `key:{keyId} → {principal_claims}` with 60s TTL
+4. Subsequent requests within 60s: Redis lookup only (no DB hit, near-zero latency)
+5. Cache miss or TTL expired: re-verify from DB + refresh cache
 
 ### 5.3 Authorization Model (RBAC + ABAC combined)
 
@@ -526,6 +570,43 @@ output:
 
 Error paths → FAILED (with structured error + full context snapshot)
 Human approval needed → PAUSED (async, timeout configurable)
+Timeout (max_wall_time_seconds hit) → TIMEOUT (see cleanup sequence below)
+```
+
+### 6.2a Agent Timeout — Cleanup Sequence
+
+When `max_wall_time_seconds` is exceeded, a structured cleanup runs. Never kill abruptly.
+
+```
+TIMEOUT CLEANUP SEQUENCE:
+
+1. Set run status → CANCELLING (prevents new steps from starting)
+2. In-flight LLM call:
+   a. If streaming: close stream, record partial response in step output
+   b. If waiting: wait max 5s for response, then cancel connection
+   c. Partial tokens consumed → still charged to cost ledger
+3. In-flight tool call:
+   a. Send SIGTERM to sandbox process/container
+   b. Wait 3s grace period
+   c. If not exited: SIGKILL
+   d. Ephemeral sandbox filesystem: destroy
+4. Release distributed lock held by this run (see Section 22.5)
+5. Write final checkpoint (all completed steps + partial step)
+6. Set run status → TIMEOUT
+7. Emit AGENT_RUN_TIMEOUT audit event
+8. Return structured error to client:
+   {
+     "error": {
+       "code": "AAI-5001",
+       "type": "RUN_TIMEOUT",
+       "message": "Run exceeded maximum wall time of 120s",
+       "completed_steps": 3,
+       "partial_output": { ... },    // output from steps that completed
+       "resumable": false            // TIMEOUT runs are not resumable
+     }
+   }
+9. Partial results option: if agent has output_on_timeout: true,
+   return the output of the last successfully completed step
 ```
 
 ### 6.3 Step Execution Engine
@@ -751,17 +832,30 @@ Cache invalidation: explicit (on agent redeploy) + TTL-based
 
 ### 8.4 Token Budget Enforcement
 
-Enforced in three places:
+Enforced in three places. **Race condition prevention is critical** — in multi-agent parallel execution, naive read-then-check allows multiple concurrent calls to all pass the budget check simultaneously, each consuming up to the full remaining budget.
 
 ```
-Pre-call check (HARD):
-  remaining = budget.max_tokens - run.tokens_used_so_far
-  estimated_call_tokens = count(messages) + max_response_tokens
-  if estimated_call_tokens > remaining: ABORT with BUDGET_EXCEEDED
+ATOMIC Pre-call check (HARD) — uses Redis atomic increment:
 
-Post-call accounting:
-  run.tokens_used_so_far += response.prompt_tokens + response.completion_tokens
-  cost_ledger.record(callId, cost)
+  # Redis Lua script (executes atomically, no TOCTOU race)
+  local current = redis.call('GET', budget_key) or 0
+  local estimated = tonumber(ARGV[1])   -- estimated tokens for this call
+  local max = tonumber(ARGV[2])         -- max_tokens_per_run
+  if tonumber(current) + estimated > max then
+    return -1   -- REJECT
+  end
+  redis.call('INCRBY', budget_key, estimated)
+  redis.call('EXPIRE', budget_key, 86400)
+  return 1      -- APPROVED (reservation made)
+
+  On REJECT: raise BUDGET_EXCEEDED, do not call LLM.
+  On APPROVE: reservation is held. Reconcile after call.
+
+Post-call reconciliation:
+  actual_used = response.prompt_tokens + response.completion_tokens
+  delta = actual_used - estimated
+  redis.call('INCRBY', budget_key, delta)    -- adjust for over/under estimate
+  cost_ledger.record(callId, actual_cost)    -- async write to DB
 
 Soft warning at 80% consumed:
   emit BUDGET_WARNING event
@@ -769,7 +863,88 @@ Soft warning at 80% consumed:
   agent may choose to summarize context to reduce future usage
 ```
 
-### 8.5 Prompt Construction & Injection Defense
+### 8.5 Tokenizer Abstraction (Per Model)
+
+Token counting MUST use the correct tokenizer for each model. `tiktoken` only covers OpenAI models. Using the wrong tokenizer leads to incorrect budget enforcement.
+
+```python
+# core/interfaces/tokenizer.py
+class TokenizerAdapter(ABC):
+    @abstractmethod
+    def count(self, text: str) -> int: ...
+
+    @abstractmethod
+    def count_messages(self, messages: list[dict]) -> int: ...
+
+# Implementations:
+# adapters/tokenizer/tiktoken_adapter.py   → OpenAI, GPT-4o, GPT-3.5
+# adapters/tokenizer/sentencepiece.py      → Llama, Mistral, Gemma, Phi
+# adapters/tokenizer/hf_tokenizer.py       → Any HuggingFace model (AutoTokenizer)
+# adapters/tokenizer/estimate.py           → Fallback: 4 chars ≈ 1 token estimate
+
+# Registry maps model_id → tokenizer_adapter
+TOKENIZER_REGISTRY = {
+    "gpt-4o":                  TiktokenAdapter("cl100k_base"),
+    "gpt-4o-mini":             TiktokenAdapter("cl100k_base"),
+    "ollama/llama3.1:8b":      SentencePieceAdapter("llama3"),
+    "ollama/mistral:7b":       SentencePieceAdapter("mistral"),
+    "ollama/phi3:medium":      SentencePieceAdapter("phi3"),
+    "bedrock/anthropic.*":     TiktokenAdapter("cl100k_base"),  # approximation
+    "__default__":             EstimateAdapter(),               # safe fallback
+}
+```
+
+### 8.6 Streaming Protocol Decision
+
+```
+Protocol   Use Case                           Reason
+────────────────────────────────────────────────────────────────
+SSE        Run event streaming to client      Unidirectional, works through
+           (step complete, token stream,      all HTTP proxies, simpler
+           cost updates)                      client implementation
+
+WebSocket  Interactive HITL sessions          Bidirectional needed:
+           where user sends approval          server pushes approval request,
+           mid-stream                         client sends approval decision
+
+gRPC       Internal service-to-service        Efficient binary framing,
+           communication only                 not exposed to external clients
+```
+
+**SSE is the default for all public API streaming.** WebSocket is only opened when an agent run explicitly enters HITL_WAIT state and requires bidirectional communication.
+
+### 8.7 PII on Streaming Output — Solved Design
+
+Streaming token-by-token and PII masking are in conflict. Solution: **sliding window buffer**.
+
+```
+PII Streaming Strategy:
+
+1. LLM streams tokens into a server-side buffer
+2. Buffer flushes to client when:
+   a. Buffer contains a "safe" delimiter (sentence end, newline, paragraph)
+   b. AND no PII entity spans the flush boundary
+3. PII scanner runs on buffer using sliding window:
+   - Window size: 200 chars (enough to detect any PII pattern)
+   - Overlap: 50 chars (prevents split-entity misses)
+4. On PII detected within window:
+   a. Replace entity with [MASKED:TYPE]
+   b. Flush up to start of entity
+   c. Flush masked replacement
+   d. Continue streaming from after entity
+5. On stream end: flush remainder, final PII scan pass
+
+Tradeoffs accepted:
+  - Latency added: 50-100ms vs raw streaming (buffer accumulation)
+  - This is a deliberate product decision: safety over raw speed
+  - Configurable: PII_STREAM_BUFFER_MS per agent definition
+
+For agents where PII is guaranteed absent (e.g., code generation only):
+  - pii_scan_output: false in agent definition
+  - Zero buffer, raw token streaming
+```
+
+### 8.8 Prompt Construction & Injection Defense
 
 ```
 PromptBuilder:
@@ -789,7 +964,7 @@ Template variable resolution:
   ALWAYS: user input goes into user message position, clearly delimited
 ```
 
-### 8.6 Response Validation
+### 8.9 Response Validation
 
 Every LLM response is validated before being acted upon:
 
@@ -1154,6 +1329,73 @@ interface VectorStore {
 // Namespace = tenant_id + agent_id + kb_id (full isolation)
 ```
 
+### 11.4 Embedding Dimension Migration Strategy
+
+When switching embedding models (e.g., moving from OpenAI text-embedding-3-small at 1536d to a local model at 768d, or upgrading to a higher-dimension model), a naive swap breaks all existing vectors. Migration procedure:
+
+```
+Phase 1 — Dual-write (zero downtime):
+  1. Register new embedding model in config alongside old model
+  2. Configure vector store to maintain two collections per namespace:
+       {namespace}__v1  → old model, 1536d
+       {namespace}__v2  → new model, 768d
+  3. New ingestion writes to BOTH collections
+  4. Retrieval reads from v1 only (stable queries)
+
+Phase 2 — Backfill (async, offline):
+  5. Background job re-embeds all existing chunks using new model
+     Rate: 1,000 chunks/min (CPU-bound; do not saturate GPU queue)
+     Checkpoint every 10,000 chunks to allow pause/resume
+     Verify: sample 1% of chunks, compare retrieval quality
+  6. Track backfill progress: backfill_progress_{kb_id} in Redis
+
+Phase 3 — Cutover:
+  7. When backfill_progress = 100%, switch retrieval to v2 collection
+     (config change only — no code deploy needed)
+  8. Run dual-retrieval smoke test (compare top-5 results for N=100 queries)
+  9. Monitor retrieval quality metrics for 48h
+  10. If quality unchanged or improved: delete v1 collection + stop dual-write
+
+Rollback: switch retrieval back to v1 collection (single config value change)
+
+Key constraints:
+  - Dimension mismatch is hard: v1 and v2 vectors are not comparable
+  - Never query across dimensions — always use model-matched collection
+  - Store embedding model name + dimension in chunk metadata for auditability
+  - Knowledge base schema version tracks which embedding model was used
+```
+
+### 11.5 Knowledge Graph — Technology Decision
+
+Knowledge graph is optional and scoped to semantic memory enrichment (entity-relationship extraction). It is NOT a primary query path — dense + sparse retrieval handles the majority of RAG queries.
+
+```
+Scope:
+  USE for: entity extraction, relationship-aware retrieval, schema-guided question answering
+  DO NOT use for: primary retrieval (too slow), real-time data (not designed for it)
+
+Default implementation: Apache AGE (PostgreSQL extension)
+  - Runs inside existing PostgreSQL cluster (no new infrastructure)
+  - Cypher query language
+  - Tenant-isolated via graph label prefix: tenant_{id}_entity
+  - Good fit for moderate-scale graphs (< 10M nodes per tenant)
+
+Alternative if graph scale exceeds PostgreSQL capacity:
+  - Neo4j (self-hosted) or Neo4j Aura (managed)
+  - Swap via GraphStoreAdapter ABC (same interface)
+
+GraphStoreAdapter interface:
+  upsert_entities(entities: list[Entity], tenant_id: str) -> None
+  upsert_relationships(rels: list[Relationship], tenant_id: str) -> None
+  query_neighbors(entity_id: str, depth: int, tenant_id: str) -> list[Entity]
+  delete_tenant(tenant_id: str) -> None
+
+When to skip knowledge graph entirely:
+  - If no agents require multi-hop entity reasoning: set enable_knowledge_graph: false
+  - Dense retrieval + reranker handles 95% of factual Q&A use cases adequately
+  - Knowledge graph adds ingestion latency (~200ms per document for NER + relation extraction)
+```
+
 ---
 
 ## 12. Layer 9 — Security & Threat Defense
@@ -1397,11 +1639,21 @@ Erasure request flow:
 ### 14.1 Hallucination Detection — Multi-Signal Approach
 
 ```
-Signal 1 — Self-consistency (cheapest):
-  - Run same prompt N times (3-5) at temperature > 0
+Signal 1 — Self-consistency (expensive — conditional triggers only):
+  - Run same prompt N=3 times at temperature=0.7 using the CHEAPEST available model
   - Compare outputs for factual consistency
   - High variance in named entities/numbers → high hallucination risk
-  - Cost: N * base call cost (use cheap model for consistency runs)
+  - Cost: 3x cheap model cost (e.g., 3 × haiku calls, not 3 × opus calls)
+
+  TRIGGER CONDITIONS (not run by default — must meet at least one):
+    a. Agent definition sets hallucination_check: strict
+    b. Task is classified as HIGH_STAKES (financial, medical, legal domain)
+    c. Prior faithfulness score for this run already > 0.4
+    d. No RAG context available (nothing to cross-check against)
+    e. Explicit agent config: self_consistency: true
+
+  DO NOT trigger for: code generation, creative tasks, data extraction with schema,
+  any agent where temperature: 0.0 is already set (deterministic = no variance)
 
 Signal 2 — RAG faithfulness:
   - For every factual claim in output, search retrieved context
@@ -2136,9 +2388,11 @@ Data isolation:
 
 Compute isolation tiers:
   SHARED (default):
-    - Shared compute pool, rate-limited
-    - Tenant data never on same pod as another tenant's active data
-    - Cost-efficient, appropriate for SMB tenants
+    - Shared compute pool, per-tenant rate limits enforced via Redis token bucket
+    - Tenant data isolated at application layer: every query carries tenant_id, DB RLS enforces it
+    - Pods are shared; data is not — a pod processes one request at a time with request-scoped context
+    - No cross-tenant data leakage risk: connection-level DB variable (SET app.tenant_id) reset per request
+    - Cost-efficient, appropriate for SMB tenants; noisy-neighbor risk mitigated by rate limits
 
   DEDICATED (premium):
     - Dedicated agent runner pool
@@ -2186,10 +2440,12 @@ Brand customization per tenant (stored in tenant config):
     agent_avatar_url:   CDN URL
     greeting_message:   custom
 
-  LLM provider override:
+  LLM provider override (BYOLLM):
     - Enterprise tenants can bring their own LLM API keys
-    - Platform does not see or store BYOLLM keys (passed through)
-    - BYOLLM cost does not appear in platform billing (tenant billed directly)
+    - Keys stored encrypted in Vault under tenant's namespace, wrapped with tenant's KMS key (AWS CMK / Azure Key Vault / GCP CMEK)
+    - Platform never logs the raw key; only the Vault secret path is stored in the DB
+    - At runtime, LLM proxy fetches the key from Vault, uses it in memory, and discards it after the response
+    - BYOLLM cost does not appear in platform billing (tenant billed directly by the provider)
 
 Platform attribution:
     hide_platform_branding: true  (available on enterprise plan)
@@ -2359,7 +2615,504 @@ Testing utilities:
 
 ## 22. Cross-Cutting Concerns
 
-### 22.1 Feature Flags
+### 22.0 Scale Targets
+
+The architecture is designed to meet these targets. All design decisions must be validated against them.
+
+```
+Tier              Metric                      Target
+──────────────────────────────────────────────────────────────────────
+Throughput        Agent run starts/sec         500 rps (peak)
+                  LLM calls/sec (proxied)      2,000 rps
+                  Tool executions/sec          5,000 rps
+                  Ingest documents/day         1,000,000
+
+Concurrency       Simultaneous agent runs      10,000
+                  Concurrent HITL waits        50,000
+                  Active WebSocket connections  100,000
+
+Latency (p99)     Auth check                  < 10ms
+                  Time-to-first-token (TTFT)  < 2s (real-time agents)
+                  Full run (simple, no tools) < 5s
+                  Full run (with tools, RAG)  < 30s
+
+Storage           Tenants                     10,000
+                  Agents per tenant           1,000
+                  Documents in knowledge base 100,000,000 chunks
+                  Audit events/day            500,000,000
+
+Reliability       Platform availability       99.9% (three 9s)
+                  Data durability             99.999999999% (eleven 9s)
+                  RPO                         1 minute
+                  RTO                         5 minutes
+```
+
+### 22.1 Database Schema (Core Tables)
+
+```sql
+-- ── TENANTS ─────────────────────────────────────────────────────────
+CREATE TABLE tenants (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    schema_version  INT NOT NULL DEFAULT 1,
+    name            TEXT NOT NULL,
+    slug            TEXT NOT NULL UNIQUE,         -- used in API key prefix
+    plan            TEXT NOT NULL DEFAULT 'free', -- free | pro | enterprise
+    status          TEXT NOT NULL DEFAULT 'active',
+    data_residency  TEXT[] NOT NULL DEFAULT '{"us"}',
+    config          JSONB NOT NULL DEFAULT '{}',  -- white-label, feature flags
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ── API KEYS ────────────────────────────────────────────────────────
+CREATE TABLE api_keys (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(id),
+    key_hash        TEXT NOT NULL UNIQUE,          -- HMAC-SHA256, hex-encoded
+    key_prefix      TEXT NOT NULL,                 -- first 8 chars, for display
+    name            TEXT NOT NULL,
+    scopes          TEXT[] NOT NULL DEFAULT '{}',
+    ip_allowlist    CIDR[] NOT NULL DEFAULT '{}',
+    rate_limit      JSONB NOT NULL DEFAULT '{}',
+    expires_at      TIMESTAMPTZ,
+    last_used_at    TIMESTAMPTZ,
+    revoked_at      TIMESTAMPTZ,
+    created_by      UUID NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_api_keys_tenant ON api_keys(tenant_id) WHERE revoked_at IS NULL;
+
+-- ── AGENTS ──────────────────────────────────────────────────────────
+CREATE TABLE agents (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(id),
+    agent_ref       TEXT NOT NULL,                 -- human-readable id
+    version         TEXT NOT NULL,                 -- semver
+    status          TEXT NOT NULL DEFAULT 'draft', -- draft | deployed | deprecated
+    definition      JSONB NOT NULL,                -- full agent.yaml as JSON
+    deployed_at     TIMESTAMPTZ,
+    created_by      UUID NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(tenant_id, agent_ref, version)
+);
+CREATE INDEX idx_agents_tenant_ref ON agents(tenant_id, agent_ref) WHERE status='deployed';
+
+-- ── AGENT RUNS ──────────────────────────────────────────────────────
+CREATE TABLE agent_runs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    schema_version  INT NOT NULL DEFAULT 1,
+    tenant_id       UUID NOT NULL REFERENCES tenants(id),
+    agent_id        UUID NOT NULL REFERENCES agents(id),
+    user_id         UUID NOT NULL,
+    session_id      UUID,
+    workflow_run_id UUID,                          -- set if part of multi-agent DAG
+    parent_run_id   UUID REFERENCES agent_runs(id),
+    status          TEXT NOT NULL DEFAULT 'pending',
+    input           JSONB NOT NULL,
+    output          JSONB,
+    error           JSONB,
+    plan            JSONB,
+    budget_config   JSONB NOT NULL,
+    tokens_used     INT NOT NULL DEFAULT 0,
+    cost_usd        DECIMAL(12,8) NOT NULL DEFAULT 0,
+    trace_id        TEXT NOT NULL,                 -- OTEL root trace
+    idempotency_key TEXT,
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(idempotency_key) WHERE idempotency_key IS NOT NULL
+);
+CREATE INDEX idx_runs_tenant_status ON agent_runs(tenant_id, status, created_at DESC);
+CREATE INDEX idx_runs_user ON agent_runs(user_id, created_at DESC);
+CREATE INDEX idx_runs_trace ON agent_runs(trace_id);
+
+-- ── RUN STEPS ───────────────────────────────────────────────────────
+CREATE TABLE run_steps (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id          UUID NOT NULL REFERENCES agent_runs(id),
+    step_index      INT NOT NULL,
+    step_type       TEXT NOT NULL,                 -- llm_call | tool_call | hitl_wait
+    step_name       TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    input           JSONB NOT NULL DEFAULT '{}',
+    output          JSONB,
+    error           JSONB,
+    tokens_used     INT,
+    cost_usd        DECIMAL(12,8),
+    latency_ms      INT,
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    UNIQUE(run_id, step_index)
+);
+CREATE INDEX idx_steps_run ON run_steps(run_id, step_index);
+
+-- ── COST LEDGER ─────────────────────────────────────────────────────
+CREATE TABLE cost_ledger (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(id),
+    run_id          UUID NOT NULL REFERENCES agent_runs(id),
+    step_id         UUID REFERENCES run_steps(id),
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    prompt_tokens   INT NOT NULL DEFAULT 0,
+    completion_tokens INT NOT NULL DEFAULT 0,
+    cached_tokens   INT NOT NULL DEFAULT 0,
+    cost_usd        DECIMAL(12,8) NOT NULL,
+    cached          BOOLEAN NOT NULL DEFAULT FALSE,
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (recorded_at);           -- monthly partitions
+
+-- ── AUDIT LOG (append-only) ─────────────────────────────────────────
+CREATE TABLE audit_events (
+    id              UUID DEFAULT gen_random_uuid(),
+    seq_num         BIGINT GENERATED ALWAYS AS IDENTITY,  -- monotonic per tenant
+    tenant_id       UUID NOT NULL,
+    event_type      TEXT NOT NULL,
+    principal_id    UUID,
+    run_id          UUID,
+    resource_type   TEXT,
+    resource_id     TEXT,
+    action          TEXT,
+    outcome         TEXT NOT NULL,             -- SUCCESS | FAILURE | BLOCKED
+    details         JSONB NOT NULL DEFAULT '{}',
+    event_hash      TEXT NOT NULL,             -- SHA256(prev_hash + event_data)
+    signature       TEXT NOT NULL,             -- RSA signature of event_hash
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, seq_num)
+) PARTITION BY RANGE (occurred_at);
+
+-- Revoke DELETE and UPDATE on audit_events from application user
+-- Only audit_service_user has INSERT permission
+REVOKE UPDATE, DELETE ON audit_events FROM app_user;
+
+-- ── MEMORY ──────────────────────────────────────────────────────────
+CREATE TABLE episodic_memory (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL,
+    user_id         UUID NOT NULL,
+    agent_id        UUID NOT NULL REFERENCES agents(id),
+    run_id          UUID,
+    content         TEXT NOT NULL,             -- PII-scrubbed summary
+    embedding_id    TEXT,                      -- reference to vector in Qdrant
+    pii_level       TEXT NOT NULL DEFAULT 'LOW',
+    relevance_score FLOAT,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_memory_user_agent ON episodic_memory(tenant_id, user_id, agent_id)
+    WHERE expires_at > NOW();
+
+-- ── HITL APPROVALS ──────────────────────────────────────────────────
+CREATE TABLE hitl_approvals (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id          UUID NOT NULL REFERENCES agent_runs(id),
+    step_id         UUID NOT NULL REFERENCES run_steps(id),
+    request         JSONB NOT NULL,            -- what the agent wants to do
+    status          TEXT NOT NULL DEFAULT 'pending',
+    decision        TEXT,                      -- approved | rejected
+    reason          TEXT,
+    approver_id     UUID,
+    token           TEXT NOT NULL UNIQUE,      -- secure token for approval link
+    expires_at      TIMESTAMPTZ NOT NULL,
+    decided_at      TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### 22.2 Service Discovery & Internal Networking
+
+All internal service-to-service calls use Kubernetes DNS. No service registry needed — K8s DNS is the registry.
+
+```
+Naming convention:
+  http://{service-name}.{namespace}.svc.cluster.local:{port}
+
+Internal URLs:
+  http://llm-proxy.platform.svc.cluster.local:8000
+  http://rag-service.platform.svc.cluster.local:8000
+  http://pii-service.platform.svc.cluster.local:8000
+  http://memory-service.platform.svc.cluster.local:8000
+  http://cost-service.platform.svc.cluster.local:8000
+  http://audit-service.platform.svc.cluster.local:8000
+  http://auth-service.platform.svc.cluster.local:8000
+  http://tool-executor.platform.svc.cluster.local:8000
+  http://security-guard.platform.svc.cluster.local:8000
+
+Service-to-service auth: mTLS via Linkerd (automatic, zero config in app code)
+Service-to-service identity: Kubernetes ServiceAccount + SPIFFE/SPIRE
+```
+
+### 22.3 Distributed Locking
+
+Required in these specific scenarios:
+
+```
+Scenario 1 — Idempotency key (prevent duplicate runs):
+  Lock key:    lock:idempotency:{idempotency_key}
+  TTL:         30s
+  Pattern:     SET NX PX 30000 → only one request wins
+               Loser gets 409 Conflict immediately
+
+Scenario 2 — Tenant budget check (prevent concurrent overspend):
+  Handled by Redis atomic INCR (Lua script) — no explicit lock needed
+  See Section 8.4
+
+Scenario 3 — DAG node execution (prevent duplicate execution):
+  Lock key:    lock:dag:{workflow_run_id}:{node_id}
+  TTL:         node.timeout_seconds * 2
+  Pattern:     Acquire before executing, release on completion
+
+Scenario 4 — Agent definition deploy (prevent concurrent deploys):
+  Lock key:    lock:deploy:{tenant_id}:{agent_ref}
+  TTL:         60s
+  Pattern:     Acquire before deploy, release on completion or error
+
+All locks:
+  Implementation: Redis SET key value NX PX {ttl_ms}
+  Lock value: unique token (UUID) — only holder can release
+  Release: Lua script: if GET key == token then DEL key end
+  Watchdog: locks renewed every TTL/3 for long-running operations
+  No Redlock: single Redis node is sufficient (we already HA Redis)
+```
+
+### 22.4 Dead Letter Queue Strategy
+
+Every queue consumer has a DLQ for messages that cannot be processed.
+
+```
+Per-topic DLQ configuration:
+
+Topic: aai.runs (agent run dispatch)
+  Max retries:    3 (1s, 5s, 30s backoff)
+  DLQ topic:      aai.runs.dlq
+  DLQ action:     Alert ops, mark run FAILED in DB, notify user
+  Manual replay:  Admin API: POST /v1/admin/dlq/runs/{messageId}/replay
+
+Topic: aai.audit-events
+  Max retries:    10 (exponential, up to 10 min)
+  DLQ topic:      aai.audit.dlq
+  DLQ action:     P0 alert — audit integrity at risk. Buffer locally.
+  Auto-replay:    YES — replay automatically when audit service recovers
+  NEVER DROP:     Audit events must not be lost. Buffer in Redis if DLQ also fails.
+
+Topic: aai.cost-ledger
+  Max retries:    5
+  DLQ topic:      aai.cost.dlq
+  DLQ action:     Alert ops, best-effort reconciliation from run records
+  Manual replay:  YES — replay when cost service recovers
+
+Topic: aai.notifications (HITL, webhooks)
+  Max retries:    5 (webhook: 5 attempts per delivery, separate from queue retries)
+  DLQ topic:      aai.notifications.dlq
+  DLQ action:     Alert tenant, mark delivery FAILED, available for manual replay
+
+DLQ monitoring:
+  Alert: DLQ depth > 0 for aai.audit.dlq → P0
+  Alert: DLQ depth > 100 for any other topic → P1
+  Dashboard: DLQ depth per topic (real-time)
+```
+
+### 22.5 Graceful Shutdown
+
+Every service handles SIGTERM before Kubernetes pod termination.
+
+```
+Graceful shutdown sequence (all services):
+
+1. SIGTERM received → set service health to DRAINING (K8s removes from load balancer)
+2. Stop accepting new connections / requests
+3. Set readiness probe to UNHEALTHY (K8s stops routing new traffic)
+4. Wait for in-flight requests to complete (drain timeout: 30s)
+5. Close all outbound connections (DB pool, Redis, NATS)
+6. Flush OTEL spans and metrics
+7. Release any distributed locks held
+8. Log: "Service shutdown complete"
+9. Exit 0
+
+Kubernetes PreStop hook:
+  lifecycle:
+    preStop:
+      exec:
+        command: ["sleep", "5"]   # give K8s 5s to remove from endpoints
+
+Termination grace period: 60s (must be > drain timeout + preStop sleep)
+
+Agent runner additional steps (between steps 3 and 4):
+  - Stop accepting new run assignments from queue
+  - Mark all in-progress run steps as INTERRUPTED
+  - Write checkpoint for each in-progress run
+  - Runs auto-resume when new runner pod picks them up from queue
+
+Run resumption after crash (non-graceful):
+  - Watchdog job runs every 30s: finds runs RUNNING > 5min with no heartbeat
+  - Marks those runs as INTERRUPTED
+  - Re-queues them for pickup by available runner
+  - Runner loads last checkpoint and continues from last completed step
+```
+
+### 22.6 Database Connection Pooling (PgBouncer)
+
+Required to prevent connection exhaustion across 18 services, each with their own pool.
+
+```
+Problem:
+  18 services × 3 pods each × 10 connections per pool
+  = 540 connections minimum at rest
+  PostgreSQL max_connections typically 200-400
+  → Exceeds limit → connection errors under normal operation
+
+Solution: PgBouncer as connection pooler
+
+Deployment: PgBouncer as a sidecar to PostgreSQL (or dedicated service)
+
+Configuration:
+  pool_mode:           transaction     # best for microservices (connection released after each txn)
+  max_client_conn:     5000            # connections from all services
+  default_pool_size:   20             # connections to actual PostgreSQL per DB user
+  min_pool_size:       5
+  reserve_pool_size:   10
+  max_db_connections:  200            # hard cap to PostgreSQL
+
+Service connection config (each service):
+  pool_size: 5          # reduced from 10 since PgBouncer multiplexes
+  max_overflow: 10
+  connect to: pgbouncer:5432 (not postgres:5432 directly)
+```
+
+### 22.7 API Versioning & Pagination
+
+```
+Versioning:
+  All public APIs: /v1/ prefix
+  Breaking change (field removal, type change, semantic change): new /v2/ prefix
+  Non-breaking change (field addition, new endpoint): same version
+  Deprecation notice: 6 months before removing old version
+  Both versions run simultaneously during transition period
+  Deprecation header on old version: Deprecation: true, Sunset: {date}
+
+Cursor-based pagination (all list endpoints):
+  Request:  GET /v1/runs?limit=50&cursor=eyJpZCI6IjEyMyJ9
+  Response: {
+    "data": [...],
+    "pagination": {
+      "cursor":      "eyJpZCI6IjQ1NiJ9",   // opaque, base64 encoded
+      "has_more":    true,
+      "total_count": null                   // omitted (expensive to compute)
+    }
+  }
+
+  Cursor encodes: {id, created_at} of last item (stable sort key)
+  Default limit: 20, max limit: 100
+  Applied to: /v1/runs, /v1/audit, /v1/tools, /v1/agents, /v1/kb/{id}/documents
+
+Rate limit response headers (all 429 responses):
+  X-RateLimit-Limit:      60          # limit for this tier
+  X-RateLimit-Remaining:  0           # requests remaining in window
+  X-RateLimit-Reset:      1719000000  # unix timestamp when window resets
+  Retry-After:            30          # seconds until retry is safe
+
+CORS (configurable per tenant for white-labeled deployments):
+  Default allowed origins: [tenant.custom_domain, platform.domain]
+  Tenant override: CORS_ALLOWED_ORIGINS in tenant config
+  Preflight cache: Access-Control-Max-Age: 86400
+```
+
+### 22.8 Health Check Contract (per service)
+
+Every service exposes two distinct probes. K8s treats them differently: failing liveness → pod restart; failing readiness → pod removed from LB without restart.
+
+```
+Liveness Probe (GET /internal/health/live):
+  Purpose:  "Is this process alive and not deadlocked?"
+  Checks:   - Event loop / thread pool is responsive (timeout < 1s)
+            - No internal deadlock detected
+  Does NOT check: database, Redis, external dependencies
+  Response: 200 {"status":"alive"} or 503 {"status":"deadlocked"}
+  Failure:  kubelet kills pod; restartPolicy applies
+  Timeout:  2s | Failure threshold: 3 | Period: 10s | Initial delay: 5s
+
+Readiness Probe (GET /internal/health/ready):
+  Purpose:  "Can this pod safely receive traffic?"
+  Checks:   Service-specific dependency checklist:
+
+  ┌─────────────────────┬──────────────────────────────────────────┐
+  │  Service            │  Readiness Dependencies                  │
+  ├─────────────────────┼──────────────────────────────────────────┤
+  │  agent-api          │  PostgreSQL ping, Redis ping, Vault reachable │
+  │  orchestrator       │  NATS connected, Redis ping              │
+  │  llm-proxy          │  ≥1 upstream provider healthy (circuit CLOSED/HALF-OPEN) │
+  │  tool-executor      │  gVisor runtime available, tool registry reachable │
+  │  memory-service     │  PostgreSQL ping, vector store ping      │
+  │  auth-service       │  PostgreSQL ping, JWKS endpoint reachable │
+  │  cost-service       │  PostgreSQL ping, Redis ping             │
+  │  pii-service        │  Presidio analyzer loaded (model warm)   │
+  └─────────────────────┴──────────────────────────────────────────┘
+
+  Response:
+    200 {"status":"ready", "checks": {"postgres":"ok", "redis":"ok", "vault":"ok"}}
+    503 {"status":"not_ready", "checks": {"postgres":"ok", "redis":"timeout"}}
+  Timeout:  3s | Failure threshold: 2 | Period: 15s | Initial delay: 10s
+
+Startup Probe (overrides liveness during slow startup):
+  GET /internal/health/live
+  Timeout: 5s | Failure threshold: 30 | Period: 5s
+  Purpose: Give time-consuming startup (e.g., Presidio model load) up to 150s before liveness kicks in
+
+Metrics endpoint (always on, separate port):
+  GET :9090/metrics  → Prometheus text format
+  Not behind auth; NetworkPolicy restricts access to monitoring namespace only
+```
+
+### 22.9 Testing Strategy
+
+```
+Unit Tests (per service, run on every commit):
+  Framework:    pytest (Python) / Vitest (TypeScript)
+  Target:       > 80% line coverage on business logic
+  Speed:        < 30s full suite per service
+  Mocking:      All external adapters mocked (no real DB/Redis/LLM in unit tests)
+  Key areas:    State machine transitions, budget enforcement, PII detection,
+                injection pattern matching, schema validation
+
+Integration Tests (per service, run on PR):
+  Framework:    pytest with testcontainers (spins up real Postgres, Redis, NATS)
+  Target:       All adapter implementations (Qdrant, pgvector, NATS, Redis)
+  LLM calls:    Use Ollama with a tiny model (llama3.2:1b) — real call, low cost
+  Speed:        < 5 min per service
+
+Contract Tests (cross-service, run on PR):
+  Framework:    Pact (consumer-driven contract testing)
+  Purpose:      Prevent llm-proxy API changes from breaking agent-runner silently
+  Coverage:     Every service-to-service API call has a contract test
+  Enforcement:  PR blocked if contract test fails
+
+End-to-End Tests (full stack, run on merge to main):
+  Environment:  Dedicated test environment (all services running)
+  Scenarios:    10 golden-path scenarios covering all major flows
+  LLM:          Ollama (real, deterministic with seed)
+  Speed:        < 20 min
+
+Security Tests (run weekly + on security-related PRs):
+  Injection suite:   100+ known injection payloads tested against security-guard
+  PII test vectors:  Synthetic PII in 10 languages tested through full pipeline
+  Auth bypass:       Known JWT attack patterns, API key brute force simulation
+  SSRF:              SSRF payloads against http_request tool
+  Tool:              OWASP ZAP (automated) + manual review quarterly
+
+Load Tests (run on merge to main, non-blocking):
+  Tool:         k6 or Locust
+  Scenarios:    Ramp to 500 rps over 10 min, hold 5 min, ramp down
+  Pass criteria: p99 < 2s at 500 rps, error rate < 0.1%
+  Frequency:    Every merge to main (non-blocking), daily in staging
+
+Performance Benchmarks (tracked over time):
+  p50/p99 latency per endpoint
+  Token throughput (tokens/sec through llm-proxy)
+  Memory usage per service at load
+  Alert if any benchmark regresses > 20% vs prior week
+```
+
+### 22.10 Feature Flags
 
 ```
 Feature flags govern:
@@ -2380,7 +3133,7 @@ Evaluation:
   - Changes take effect within 30 seconds (no deploy needed)
 ```
 
-### 22.2 Configuration Management
+### 22.11 Configuration Management
 
 ```
 Config precedence (highest to lowest):
@@ -2400,7 +3153,7 @@ Secrets never in config files:
   - Secrets cached in memory for 5 min (reduce secret store load)
 ```
 
-### 22.3 Error Handling Philosophy
+### 22.12 Error Handling Philosophy
 
 ```
 Every error:
@@ -2429,7 +3182,7 @@ Error response format:
   }
 ```
 
-### 22.4 Idempotency
+### 22.13 Idempotency
 
 ```
 All run-creating API calls support idempotency:
@@ -2463,7 +3216,7 @@ Tracing a single user request through the full system:
     - Route to auth-service
 
 03. AUTH SERVICE:
-    - Validate API key (bcrypt compare, constant-time)
+    - Validate API key: compute HMAC-SHA256(key, server_secret), check Redis cache (60s TTL), fall back to DB lookup
     - Extract tenant_id, user_id, scopes from key record
     - Generate short-lived internal JWT (15 min, signed with internal key)
     - Return 200 + claims to gateway
@@ -2625,6 +3378,21 @@ If auth service fails:
   → Alert immediately
 ```
 
+### 24.4 Incident Response Runbooks
+
+| Scenario | Detection | Immediate Action | Escalation |
+|----------|-----------|-----------------|------------|
+| All LLM providers down | Circuit breakers all OPEN; error rate 100% | Activate static fallback response; page on-call | P0 — notify all tenants within 15 min |
+| Database primary down | Healthcheck failures; write errors | Promote replica to primary (automated PG Patroni failover < 30s) | P1 — monitor failover completion |
+| Redis unavailable | Cache miss floods DB; budget enforcement degraded | Apply conservative budget (reject all runs > $0.10); alert ops | P1 — restore Redis or switch to in-memory fallback |
+| Secret store unreachable | Service startup failures; 500s on secret refresh | Services use cached secrets (TTL: 60s); alert; prepare manual key rotation | P1 |
+| NATS cluster down | Message queue backlogs; async tasks stalled | Drain in-flight HTTP requests; hold new runs; alert | P1 |
+| Prompt injection attack (confirmed) | Injection detection alert spike | Rate-limit offending tenant to 0; quarantine affected runs | P1 — security team |
+| Data breach suspected | Anomaly in audit log; cross-tenant query attempt | Isolate affected service; preserve evidence; page security lead | P0 — GDPR 72h clock starts |
+| Cost anomaly (spend spike) | Cost anomaly alert threshold | Auto-throttle tenant; alert tenant admin | P2 |
+
+Full P0/P1/P2/P3 runbooks with step-by-step forensics procedures are in `SECURITY_ARCHITECTURE.md` Section 9.
+
 ---
 
 ## 25. Implementation Roadmap
@@ -2699,4 +3467,5 @@ Phased implementation — each phase delivers working end-to-end value:
 
 ---
 
-*Architecture Version: 1.0 | Status: Design Complete | Next: Phase 1 Implementation*
+*Architecture Version: 1.1 | Status: Design Complete + All Issues Resolved | Next: Phase 1 Implementation*  
+*Companion documents: SYSTEM_DESIGN.md · SEQUENCE_DIAGRAMS.md · SECURITY_ARCHITECTURE.md*
