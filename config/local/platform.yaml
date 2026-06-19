@@ -1,0 +1,49 @@
+# Local development configuration
+# All values here are overridable via AAI_* env vars
+
+environment: local
+debug: true
+
+database:
+  url: "postgresql+asyncpg://aai:aai@localhost:5432/aai"
+  pool_size: 5
+  max_overflow: 5
+
+redis:
+  url: "redis://localhost:6379/0"
+
+vault:
+  addr: "http://localhost:8200"
+  auth_method: token
+  token: "dev-root-token"
+  mount_path: secret
+
+nats:
+  url: "nats://localhost:4222"
+  stream_name: AAI_EVENTS_LOCAL
+
+qdrant:
+  url: "http://localhost:6333"
+
+llm:
+  provider: litellm
+  default_model: gpt-4o-mini
+  ollama_url: "http://localhost:11434"
+
+auth:
+  api_key_secret: "local-dev-secret-not-for-production"
+  api_key_cache_ttl: 60
+  jwt_audience: aai-platform
+  internal_jwt_secret: "local-internal-dev-secret"
+  internal_jwt_ttl: 300
+
+observability:
+  endpoint: "http://localhost:4317"
+  service_name: aai-platform-local
+  exporter: grpc
+  log_level: DEBUG
+
+secret_store_backend: vault
+vector_store_backend: qdrant
+message_bus_backend: nats
+auth_provider_backend: keycloak

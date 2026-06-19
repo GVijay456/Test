@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.4.29"
+
+jobs:
+  lint-and-type-check:
+    name: Lint + Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install workspace
+        run: uv sync --all-packages
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy — core
+        run: uv run mypy packages/core/src
+
+      - name: Mypy — auth
+        run: uv run mypy services/auth/src
+        continue-on-error: true   # remove once service skeleton is typed
+
+      - name: Mypy — agent-api
+        run: uv run mypy services/agent-api/src
+        continue-on-error: true
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: aai
+          POSTGRES_PASSWORD: aai
+          POSTGRES_DB: aai
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install workspace
+        run: uv sync --all-packages
+
+      - name: Run tests
+        env:
+          AAI_DB_URL: postgresql+asyncpg://aai:aai@localhost:5432/aai
+          AAI_REDIS_URL: redis://localhost:6379/0
+          AAI_AUTH_API_KEY_SECRET: ci-test-secret
+          AAI_AUTH_INTERNAL_JWT_SECRET: ci-internal-secret
+        run: |
+          uv run pytest \
+            packages/core/tests \
+            --cov=packages/core/src \
+            --cov-report=term-missing \
+            --cov-fail-under=80 \
+            -v
+
+  docker-build:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [auth, agent-api, orchestrator, llm-proxy]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.service }}
+        run: |
+          docker build \
+            -f services/${{ matrix.service }}/Dockerfile \
+            --target=base \
+            services/${{ matrix.service }}
+        continue-on-error: true   # remove once Dockerfiles are added
