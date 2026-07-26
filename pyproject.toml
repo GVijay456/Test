@@ -1,6 +1,7 @@
 [tool.uv.workspace]
 members = [
     "packages/core",
+    "packages/observability",
     "services/auth",
     "services/agent-api",
     "services/orchestrator",
@@ -10,6 +11,11 @@ members = [
 
 [tool.uv.sources]
 aai-core = { workspace = true }
+aai-observability = { workspace = true }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "--import-mode=importlib"
 
 [tool.uv]
 dev-dependencies = [
