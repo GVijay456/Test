@@ -10,10 +10,10 @@
 | Phase | What | Status |
 |-------|------|--------|
 | 0 — Design & Docs | Architecture + system design + diagrams + security | ✅ Complete |
-| 1 — Foundation | Core abstractions, auth, agent runtime, LLM abstraction, observability | ⬜ Not started |
-| 2 — Security & Quality | AuthZ, tool sandbox, PII, injection defense, audit trail | ⬜ Not started |
-| 3 — Intelligence & Cost | Memory, RAG, model routing, semantic cache, cost enforcement | ⬜ Not started |
-| 4 — Scale & Multi-Agent | DAG orchestration, HITL, FinOps dashboard, advanced hallucination | ⬜ Not started |
+| 1 — Foundation | Core abstractions, auth, agent runtime, LLM abstraction, observability, MCP layer, parallel tool exec | 🔄 In progress |
+| 2 — Security & Quality + Evals | AuthZ, tool sandbox, PII, injection defense, audit trail, **evals service** | ⬜ Not started |
+| 3 — Intelligence & Cost | Memory, RAG + **GraphRAG**, model routing, semantic cache, cost enforcement, adaptive retrieval | ⬜ Not started |
+| 4 — Scale & Multi-Agent + A2A | DAG orchestration, HITL, FinOps dashboard, advanced hallucination, **A2A protocol adapter** | ⬜ Not started |
 | 5 — Enterprise | Multi-tenancy isolation, white-labeling, GDPR, SDK | ⬜ Not started |
 | 6 — Continuous Learning | Feedback pipeline, drift detection, A/B testing | ⬜ Not started |
 
@@ -42,9 +42,11 @@
 
 ---
 
-## Phase 1 — Foundation (Weeks 1–4) ⬜
+## Phase 1 — Foundation (Weeks 1–4) 🔄
 
-**Deliverable:** Single-agent run with one LLM provider, full observability, end-to-end working.
+**Deliverable:** Single-agent run with one LLM provider, full observability, MCP tools, parallel tool execution — end-to-end working.
+
+> **Architecture update (2026-07-26):** Added MCP server layer, reasoning model support (thinking tokens/blocks), parallel tool executor, and adaptive retrieval to this phase based on 2026 agentic AI trends.
 
 ### Monorepo Skeleton
 - [ ] Create monorepo structure (`services/`, `packages/`, `infra/`, `config/`)
@@ -54,12 +56,15 @@
 - [ ] `docker-compose.yml` — local dev stack (postgres, redis, nats, vault, qdrant)
 
 ### Layer 0 — Core Abstractions (`packages/core`)
-- [ ] Domain types with `schema_version` field (AgentRun, RunStep, Tool, Agent, Tenant)
-- [ ] Plugin ABC (`Plugin`, `PluginHook`, `HealthStatus`)
-- [ ] Adapter ABCs: `LLMProvider`, `VectorStore`, `SecretStore`, `MessageBus`, `AuthProvider`
-- [ ] Configuration loader (YAML → Pydantic model, env var override)
-- [ ] Tokenizer abstraction + registry (tiktoken for OpenAI, SentencePiece for Llama/Mistral, EstimateAdapter fallback)
-- [ ] Error code registry (`AAI-XXXX` codes)
+- [x] Domain types with `schema_version` field (AgentRun, RunStep, Tool, Agent, Tenant)
+- [x] Plugin ABC (`Plugin`, `PluginHook`, `HealthStatus`)
+- [x] Adapter ABCs: `LLMProvider`, `VectorStore`, `SecretStore`, `MessageBus`, `AuthProvider`
+- [x] `LLMProvider` + `LLMResponse` with reasoning model fields (`thinking_tokens`, `thinking_blocks`)
+- [x] **MCP adapter ABC** (`MCPAdapter`, `MCPToolAdapter`) — plug any MCP server as a platform tool
+- [x] **Adaptive retrieval** (`packages/core/src/aai_core/retrieval/adaptive.py`) — skip RAG when doc fits context
+- [x] Configuration loader (YAML → Pydantic model, env var override)
+- [x] Tokenizer abstraction + registry (tiktoken for OpenAI, SentencePiece for Llama/Mistral, EstimateAdapter fallback)
+- [x] Error code registry (`AAI-XXXX` codes)
 
 ### Layer 1 — API Gateway (`services/gateway`)
 - [ ] Kong config or FastAPI proxy with TLS termination
@@ -69,35 +74,37 @@
 - [ ] Security response headers (HSTS, CSP, X-Frame-Options)
 
 ### Layer 2 — Authentication (`services/auth`)
-- [ ] API key validation: HMAC-SHA256 + Redis 60s cache + DB fallback
-- [ ] JWT/OIDC validation: JWKS fetch + cache + exp/iss/aud check
-- [ ] Internal JWT minting (short-lived, 5 min, signed)
-- [ ] Keycloak adapter (first auth provider)
-- [ ] IP allowlist check per tenant
+- [x] API key validation: HMAC-SHA256 + Redis 60s cache + DB fallback
+- [x] JWT/OIDC validation: JWKS fetch + cache + exp/iss/aud check
+- [x] Internal JWT minting (short-lived, 5 min, signed)
+- [x] Keycloak adapter (first auth provider)
+- [x] IP allowlist check per tenant
 
 ### Layer 3 — Agent API + Runtime (`services/agent-api`, `services/orchestrator`)
-- [ ] `POST /v1/runs` endpoint (idempotency key, tenant validation)
-- [ ] Agent run state machine (PENDING → RUNNING → DONE/FAILED/CANCELLED)
-- [ ] Basic step executor (sequential steps, no DAG yet)
-- [ ] SSE streaming endpoint (`GET /v1/runs/{id}/stream`)
-- [ ] Run checkpoint write (before each step)
-- [ ] Graceful shutdown with SIGTERM handler + run resume on restart
-- [ ] DB schema migration (Alembic): tenants, api_keys, agents, agent_runs, run_steps
+- [x] `POST /v1/runs` endpoint (idempotency key, tenant validation)
+- [x] Agent run state machine (PENDING → RUNNING → DONE/FAILED/CANCELLED/PAUSED)
+- [x] Basic step executor (sequential steps, no DAG yet)
+- [x] **Parallel tool executor** (`services/orchestrator/src/orchestrator/executor/parallel_tool.py`) — fan-out multiple tool_calls from a single LLM response with `asyncio.gather`
+- [x] SSE streaming endpoint (`GET /v1/runs/{id}/stream`)
+- [x] Run checkpoint write (before each step)
+- [x] Graceful shutdown with SIGTERM handler + run resume on restart
+- [x] DB schema migration (Alembic): agents, agent_runs, run_steps (0001), thinking columns (0002)
 - [ ] PgBouncer config (transaction mode)
 
 ### Layer 5 — LLM Abstraction (`services/llm-proxy`)
-- [ ] LiteLLM proxy wrapper
-- [ ] OpenAI adapter (first provider)
-- [ ] Ollama adapter (first open-source provider)
-- [ ] Schema validation on LLM responses
-- [ ] Basic circuit breaker (per provider, CLOSED/OPEN/HALF-OPEN)
-- [ ] Token count estimation (tokenizer registry)
+- [x] LiteLLM proxy wrapper
+- [x] OpenAI adapter (first provider)
+- [x] Ollama adapter (first open-source provider)
+- [x] Schema validation on LLM responses
+- [x] Basic circuit breaker (per provider, CLOSED/OPEN/HALF-OPEN)
+- [x] Token count estimation (tokenizer registry)
+- [x] Reasoning model support: `thinking_tokens` + `thinking_blocks` fields in `LLMResponse`
 
 ### Layer 13 — Observability (`services/otel-collector`)
-- [ ] OpenTelemetry SDK instrumentation in all services
-- [ ] Trace propagation across service calls
-- [ ] Structured JSON logging (request_id, run_id, tenant_id in every log line)
-- [ ] Prometheus metrics: request rate, latency p50/p99, error rate
+- [x] OpenTelemetry SDK instrumentation in all services
+- [x] Trace propagation across service calls
+- [x] Structured JSON logging (request_id, run_id, tenant_id in every log line)
+- [x] Prometheus metrics: request rate, latency p50/p99, error rate, LLM cost/tokens, circuit breaker trips
 - [ ] Grafana dashboards: service health, run status, LLM call latency
 - [ ] Health probe endpoints: `/internal/health/live` and `/internal/health/ready` per service
 
@@ -109,9 +116,11 @@
 
 ---
 
-## Phase 2 — Security & Quality (Weeks 5–8) ⬜
+## Phase 2 — Security & Quality + Evals (Weeks 5–8) ⬜
 
-**Deliverable:** Production-safe agent runs — all guardrails active.
+**Deliverable:** Production-safe agent runs — all guardrails active. Evals service elevated from Phase 6.
+
+> **Architecture update (2026-07-26):** Evals moved here from Phase 6. Continuous evaluation is a prerequisite for safe production deployment, not a post-launch nice-to-have.
 
 ### Layer 2 — Authorization (`services/auth` + OPA)
 - [ ] OPA deployment + Rego policy bundle
@@ -149,6 +158,14 @@
 - [ ] Tenant-scoped audit query API (`GET /v1/audit?from=&to=`)
 - [ ] Audit export (CSV/JSON for compliance)
 
+### Evals Service (`services/evals`) — **NEW: elevated from Phase 6**
+- [ ] Eval dataset format (JSONL: input + expected_output + metadata)
+- [ ] LLM-as-judge eval runner (correctness, faithfulness, groundedness)
+- [ ] Deterministic eval runners (exact match, JSON schema match, regex)
+- [ ] Eval run API: `POST /v1/evals/runs`, `GET /v1/evals/runs/{id}/results`
+- [ ] Regression gate: block agent version promotion if eval score drops > threshold
+- [ ] Eval result dashboard (pass rate, score distribution per dataset)
+
 ### Phase 2 Exit Criteria
 - [ ] Prompt injection test suite (100 payloads) — all detected or blocked
 - [ ] PII test vectors (SSN, CC, email in 5 languages) — all masked in output
@@ -160,7 +177,9 @@
 
 ## Phase 3 — Intelligence & Cost (Weeks 9–12) ⬜
 
-**Deliverable:** RAG-enabled agents with cost control and memory.
+**Deliverable:** RAG-enabled agents with cost control and memory. GraphRAG elevated from optional to core.
+
+> **Architecture update (2026-07-26):** GraphRAG (Microsoft research shows 40–80% improvement on multi-hop reasoning tasks) promoted to required Phase 3 feature. Adaptive retrieval already implemented in Phase 1.
 
 ### Layer 5 — Model Routing + Cache (`services/llm-proxy` additions)
 - [ ] Cost-aware routing (cheapest capable model for task)
@@ -185,6 +204,8 @@
 - [ ] BM25 index write (keyword search)
 - [ ] Multi-strategy retrieval: dense + sparse + RRF fusion
 - [ ] Cross-encoder reranker (ms-marco-MiniLM)
+- [ ] **GraphRAG** — entity extraction → knowledge graph → community summaries → graph-augmented retrieval (Apache AGE / Neo4j backend)
+- [ ] Adaptive retrieval integration (check context budget before chunking; full-doc load when it fits)
 - [ ] Citation validation (faithfulness guardrail post-response)
 - [ ] Embedding dimension migration procedure (dual-write → backfill → cutover)
 
@@ -204,9 +225,11 @@
 
 ---
 
-## Phase 4 — Scale & Multi-Agent (Weeks 13–16) ⬜
+## Phase 4 — Scale & Multi-Agent + A2A (Weeks 13–16) ⬜
 
-**Deliverable:** Complex multi-agent DAG workflows at scale.
+**Deliverable:** Complex multi-agent DAG workflows at scale, cross-vendor agent interop.
+
+> **Architecture update (2026-07-26):** A2A (Agent-to-Agent protocol, Google 2025) adapter added. Enables our agents to call agents hosted on other platforms and vice versa — critical for enterprise integrations.
 
 ### Layer 4 — Multi-Agent Orchestration (`services/orchestrator`)
 - [ ] DAG engine: topological sort, level-based parallel execution
@@ -235,6 +258,13 @@
 - [ ] Cost trend charts (Grafana panels)
 - [ ] Budget utilization alerts (Prometheus alert rules)
 - [ ] Cost export API (CSV/JSON)
+
+### A2A Protocol Adapter (`services/a2a-bridge`) — **NEW**
+- [ ] A2A server endpoint: expose platform agents as A2A-compatible agents
+- [ ] A2A client: call external A2A agents from within a run
+- [ ] Agent Card generation (`/.well-known/agent.json`) for registered agents
+- [ ] Capability negotiation (streaming, push, structured output)
+- [ ] A2A authentication: OAuth 2.0 bearer token per spec
 
 ### Phase 4 Exit Criteria
 - [ ] 5-agent DAG completes with parallel fan-out; results merged correctly

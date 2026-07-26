@@ -30,6 +30,12 @@ class LLMResponse:
     cost_usd: float = 0.0
     raw: dict[str, Any] = field(default_factory=dict)
 
+    # Reasoning model fields (o3, claude extended thinking, DeepSeek R1)
+    # thinking_tokens are billed separately and must NOT be passed back to the
+    # model as assistant content — strip before building next message.
+    thinking_tokens: int = 0
+    thinking_blocks: list[dict[str, Any]] = field(default_factory=list)
+
 
 @dataclass
 class LLMStreamChunk:

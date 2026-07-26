@@ -92,6 +92,8 @@ class RunStep(Base):
     prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.0")
+    thinking_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    thinking_blocks: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="[]")
 
     tool_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     tool_input: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

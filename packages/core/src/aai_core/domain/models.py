@@ -200,6 +200,8 @@ class RunStep(_Base):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float = 0.0
+    thinking_tokens: int = 0
+    thinking_blocks: list[dict[str, Any]] = Field(default_factory=list)
 
     # Tool call fields
     tool_id: str | None = None
